@@ -31,6 +31,7 @@ parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam. de
 parser.add_argument('--cuda', action='store_true', help='enables cuda')
 parser.add_argument('--netG', default='', help="path to netG (to continue training)")
 parser.add_argument('--netD', default='', help="path to netD (to continue training)")
+parser.add_argument('--netQ', default='', help="path to netQ (to continue training)")
 parser.add_argument('--outf', default='./checkpoints', help='folder to output images and model checkpoints')
 parser.add_argument('--manualSeed', type=int, help='manual seed')
 
@@ -81,6 +82,8 @@ def saving_path(root_path):
 def weights_init(m):
     classname = m.__class__.__name__
     if classname.find('Conv') != -1:
+        m.weight.data.normal_(0.0, 0.02)
+    if classname.find('Linear') != -1:
         m.weight.data.normal_(0.0, 0.02)
     elif classname.find('BatchNorm') != -1:
         m.weight.data.normal_(1.0, 0.02)
@@ -158,11 +161,23 @@ class Discriminator(nn.Module):
         else:
             dis_out = self.discriminator(output)
             dis_out = dis_out.view(-1, 1).squeeze(1)
-            Q_out = self.Q(output.view(opt.batchSize, -1))
-            # a = torch.sum(self.discriminator[0].weight.data)
-            # s = torch.sum(self.Q[0].weight.data)
-            # print(a, s)
-            return dis_out, Q_out
+            # Q_out = self.Q(output.view(opt.batchSize, -1))
+            return dis_out, output
+
+
+class Q(nn.Module):
+    def __init__(self):
+        super(Q, self).__init__()
+        self.Q = nn.Sequential(
+            nn.Linear(ndf * 8 * 4 * 4, 100),
+            nn.ReLU(),
+            nn.Linear(100, c_size)
+        )
+
+    def forward(self, input, with_Q=False):
+        # print(torch.mean(self.Q[0].weight.data))
+        Q_out = self.Q(input.view(opt.batchSize, -1))
+        return Q_out
 
 
 def sample_noise(z_size, cond_cls, batch_size, fixed_noise=None):
@@ -182,8 +197,6 @@ def sample_noise(z_size, cond_cls, batch_size, fixed_noise=None):
         noise = fixed_noise
         
     z = torch.cat([cond.to(device), noise.to(device)], 1).view(batch_size, -1, 1, 1)
-    # if fixed_noise is None:
-    #     z = torch.randn(batch_size, z_size, 1, 1, device=device)
     return z, idx
 
 
@@ -201,17 +214,21 @@ def trainIters():
     if opt.netD != '':
         netD.load_state_dict(torch.load(opt.netD))
     # print(netD)
+    netQ = Q().to(device)
+    netQ.apply(weights_init)
+    if opt.netQ != '':
+        netQ.load_state_dict(torch.load(opt.netQ))
+    # print(netQ)
     criterion_D = nn.BCELoss().to(device)
     criterion_Q = nn.CrossEntropyLoss().to(device)
 
     # setup optimizer
     optimizerD = optim.Adam(netD.parameters(), lr=opt.dlr, betas=(opt.beta1, 0.999))
-    optimizerG = optim.Adam(netG.parameters(), lr=opt.glr, betas=(opt.beta1, 0.999))
+    optimizerG = optim.Adam([{'params':netG.parameters()}, {'params':netQ.parameters()}], lr=opt.glr, betas=(opt.beta1, 0.999))
 
     mul = opt.batchSize // c_size
     fixed_noise = np.random.normal(size=(c_size, nz - c_size, 1, 1)).repeat(mul, axis=0)
     fixed_noise = torch.Tensor(fixed_noise, device=device)
-    # fixed_noise = torch.randn(opt.batchSize, nz - c_size, 1, 1, device=device)
 
     real_label = 1
     fake_label = 0
@@ -227,11 +244,9 @@ def trainIters():
 
     for epoch in range(opt.niter):
         for i, data in enumerate(dataloader):
-            ############################
-            # (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
-            ###########################
+            # (1) Update D 
             # train with real
-            netD.zero_grad()
+            optimizerD.zero_grad()
             real_cpu = data[0].to(device)
             batch_size = real_cpu.size(0)
             label = torch.full((batch_size,), real_label, device=device)
@@ -253,25 +268,20 @@ def trainIters():
             errD = errD_real + errD_fake
             optimizerD.step()
 
-            ############################
-            # (2) Update G & Q network: maximize log(D(G(z)))
-            ###########################
-            netG.zero_grad()
-            netD.zero_grad()
-            fake = netG(z)
+            # (2) Update G & Q 
+            optimizerG.zero_grad()
             label.fill_(real_label)  # fake labels are real for generator cost
-            D_output, Q_output = netD(fake, with_Q=True)
+            D_output, Q_input = netD(fake, with_Q=True)
             reconstruct_loss = criterion_D(D_output, label)
-            # reconstruct_loss.backward()
             D_G_z2 = D_output.mean().item()
 
+            Q_output = netQ(Q_input)
             target = torch.LongTensor(c_idx).to(device)
             q_loss = criterion_Q(Q_output, target)
 
-            G_loss = reconstruct_loss + q_loss
-            G_loss.backward()
+            G_Q_loss = reconstruct_loss + q_loss
+            G_Q_loss.backward()
             optimizerG.step()
-            optimizerD.step()
 
             print('[%d/%d][%d/%d] Loss_D: %.4f Loss_G: %.4f Loss_Q: %.4f D(x): %.4f D(G(z)): %.4f / %.4f'
                 % (epoch, opt.niter, i, len(dataloader),
@@ -281,7 +291,9 @@ def trainIters():
                         '%s/real_samples.png' % img_path,
                         normalize=True, nrow=c_size)
                 f_noise, _ = sample_noise(nz, c_size, batch_size, fixed_noise)
+                netG.eval()
                 fake = netG(f_noise)
+                netG.train()
                 vutils.save_image(fake.detach(),
                         '%s/fake_samples_epoch_%03d.png' % (img_path, epoch),
                         normalize=True, nrow=c_size)
@@ -292,6 +304,7 @@ def trainIters():
         # do checkpointing
         torch.save(netG.state_dict(), '%s/netG_epoch_%d.pth' % (cp_path, epoch))
         torch.save(netD.state_dict(), '%s/netD_epoch_%d.pth' % (cp_path, epoch))
+        torch.save(netQ.state_dict(), '%s/netQ_epoch_%d.pth' % (cp_path, epoch))
 
 
 def save_history(tmp_dict, loss_d, loss_g, loss_q, D_x, D_G_z1, D_G_z2, save_dict=None):
