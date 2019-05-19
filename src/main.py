@@ -157,7 +157,11 @@ class Discriminator(nn.Module):
             return out
         else:
             dis_out = self.discriminator(output)
+            dis_out = dis_out.view(-1, 1).squeeze(1)
             Q_out = self.Q(output.view(opt.batchSize, -1))
+            # a = torch.sum(self.discriminator[0].weight.data)
+            # s = torch.sum(self.Q[0].weight.data)
+            # print(a, s)
             return dis_out, Q_out
 
 
@@ -177,7 +181,7 @@ def sample_noise(z_size, cond_cls, batch_size, fixed_noise=None):
 
         noise = fixed_noise
         
-    z = torch.cat([noise.to(device), cond.to(device)], 1).view(batch_size, -1, 1, 1)
+    z = torch.cat([cond.to(device), noise.to(device)], 1).view(batch_size, -1, 1, 1)
     # if fixed_noise is None:
     #     z = torch.randn(batch_size, z_size, 1, 1, device=device)
     return z, idx
@@ -238,7 +242,7 @@ def trainIters():
             D_x = output.mean().item()
 
             # train with fake
-            z, cond_idx = sample_noise(nz, c_size, batch_size)
+            z, c_idx = sample_noise(nz, c_size, batch_size)
             fake = netG(z)
             label.fill_(fake_label)
             output = netD(fake.detach())
@@ -253,18 +257,21 @@ def trainIters():
             # (2) Update G & Q network: maximize log(D(G(z)))
             ###########################
             netG.zero_grad()
+            netD.zero_grad()
+            fake = netG(z)
             label.fill_(real_label)  # fake labels are real for generator cost
             D_output, Q_output = netD(fake, with_Q=True)
             reconstruct_loss = criterion_D(D_output, label)
             # reconstruct_loss.backward()
             D_G_z2 = D_output.mean().item()
 
-            target = torch.LongTensor(cond_idx).to(device)
+            target = torch.LongTensor(c_idx).to(device)
             q_loss = criterion_Q(Q_output, target)
 
             G_loss = reconstruct_loss + q_loss
             G_loss.backward()
             optimizerG.step()
+            optimizerD.step()
 
             print('[%d/%d][%d/%d] Loss_D: %.4f Loss_G: %.4f Loss_Q: %.4f D(x): %.4f D(G(z)): %.4f / %.4f'
                 % (epoch, opt.niter, i, len(dataloader),
