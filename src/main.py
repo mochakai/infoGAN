@@ -34,6 +34,7 @@ parser.add_argument('--netD', default='', help="path to netD (to continue traini
 parser.add_argument('--netQ', default='', help="path to netQ (to continue training)")
 parser.add_argument('--outf', default='./checkpoints', help='folder to output images and model checkpoints')
 parser.add_argument('--manualSeed', type=int, help='manual seed')
+parser.add_argument('--eval', type=int, default=-1, help='0 ~ (c_size-1)')
 
 opt = parser.parse_args()
 
@@ -219,9 +220,13 @@ def trainIters():
     if opt.netQ != '':
         netQ.load_state_dict(torch.load(opt.netQ))
     # print(netQ)
+
+    if opt.eval != -1:
+        eval_result(opt, netG)
+        return
+
     criterion_D = nn.BCELoss().to(device)
     criterion_Q = nn.CrossEntropyLoss().to(device)
-
     # setup optimizer
     optimizerD = optim.Adam(netD.parameters(), lr=opt.dlr, betas=(opt.beta1, 0.999))
     optimizerG = optim.Adam([{'params':netG.parameters()}, {'params':netQ.parameters()}], lr=opt.glr, betas=(opt.beta1, 0.999))
@@ -320,6 +325,26 @@ def save_history(tmp_dict, loss_d, loss_g, loss_q, D_x, D_G_z1, D_G_z2, save_dic
             tmp_dict[key] = []
         with open(os.path.join(opt.outf, 'history.json'), 'w') as f:
             json.dump(save_dict, f)
+
+
+def eval_result(opt, G):
+    if opt.eval >= 0 and opt.eval < c_size:
+        one_hot = np.zeros(c_size)
+        one_hot[opt.eval] = 1.0
+        cond = torch.Tensor(one_hot, device=device).view(1, -1, 1, 1)
+        
+        fixed_noise = np.random.normal(size=(1, nz - c_size, 1, 1))
+        fixed_noise = torch.Tensor(fixed_noise, device=device)
+        z = torch.cat([cond, fixed_noise], 1).view(1, -1, 1, 1)
+        
+        G.eval()
+        fake = G(z)
+        G.train()
+        vutils.save_image(fake.detach(),
+                '%s/fake_eval_%d.png' % ('./', opt.eval),
+                normalize=True)
+    else:
+        raise ValueError('eval number must between 0 and c_size-1')
 
 
 if __name__ == '__main__':
